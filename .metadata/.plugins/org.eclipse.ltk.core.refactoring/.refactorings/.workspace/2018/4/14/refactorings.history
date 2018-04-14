@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">&#x0A;<refactoring comment="Delete 4 resources" deleteContents="false" description="Delete 4 resources" element1="/LPC1769_asm_basic" element2="/LPC1769_asm_blinky" element3="/LPC1769_CMSIS_MCU_blinky" element4="/LPC1769_plainC_blinky" flags="7" id="org.eclipse.ltk.core.refactoring.delete.resources" resources="4" stamp="1522685388521"/>&#x0A;<refactoring comment="Delete resource &apos;Lib_EaBaseBoard/inc/accX.h&apos;" deleteContents="false" description="Delete resource &apos;Lib_EaBaseBoard/inc/accX.h&apos;" element1="/Lib_EaBaseBoard/inc/accX.h" flags="7" id="org.eclipse.ltk.core.refactoring.delete.resources" resources="1" stamp="1522758944949"/>
+</session>
