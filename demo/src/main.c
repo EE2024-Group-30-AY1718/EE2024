@@ -1,20 +1,20 @@
 /*****************************************************************************
- *   A demo example using several of the peripherals on the base board
- *
+ *   EE2024 Assignment 2    Lab Session W1, Lab Group 30
+ *   Name: Julian Shoung; Matric No: A0159944M
+ *   Name: Martyn Wong; Matric No: A0159915R
  *   Copyright(C) 2011, EE2024
  *   All rights reserved.
  *
  ******************************************************************************/
-
+//LPC Libraries
 #include "lpc17xx_pinsel.h"
 #include "lpc17xx_gpio.h"
 #include "lpc17xx_i2c.h"
 #include "lpc17xx_ssp.h"
 #include "lpc17xx_timer.h"
 #include "lpc17xx_uart.h"
-#include "lpc17xx_rit.h"
-#include "lpc17xx_clkpwr.h"
 
+//Baseboard Libraries
 #include "joystick.h"
 #include "pca9532.h"
 #include "acc.h"
@@ -25,16 +25,40 @@
 #include "temp.h"
 #include "light.h"
 
+//C Libraries
+#include <stdio.h>
+#include <string.h>
+
 #define NUM_HALF_PERIODS 340
 #define TEMP_SCALAR_DIV10 1
-#define TEMP_THRESHOLD_10C 270
 #define ACC_THRESHOLD 0.4
-#define OBS_THRESHOLD 3000
 #define RGB_RED   0x01
 #define RGB_BLUE  0x02
 
+//Set temperature threshold
+#define TEMP_THRESHOLD_10C 300
+
 const uint32_t lightLoLimit = 1;
 const uint32_t lightHiLimit = 4000;
+
+//Arrays Buffers for UART receive
+char umsg[4] = {};
+char submsg[4] = {};
+char* sensor_readings[50]= {};
+char* distance_reading[50]= {};
+static char* msg = NULL;
+
+int32_t xoff = 0;
+int32_t yoff = 0;
+int8_t x = 0;
+int8_t y = 0;
+int8_t z = 0;
+
+uint8_t clearWarning = 1;
+
+uint8_t data = 0;
+uint32_t len = 0;
+
 
 volatile uint32_t msTicks;
 
@@ -55,9 +79,9 @@ volatile int isVeered = 0;
 volatile int isNearObs = 0;
 volatile int firstEntry = 1;
 volatile int obsFlag = 0;
-volatile int isPrintTime = 0;
 volatile int32_t tempCount = 0;
 volatile int32_t temperature = 0;
+volatile int32_t light_val = 0;
 volatile uint32_t startTime = 0;
 volatile uint32_t endTime = 0;
 volatile uint32_t startBlinkRed = 0;
@@ -71,9 +95,6 @@ volatile uint32_t initialClick = 0;
 volatile uint8_t rgbRedStatus = 0x01;
 volatile uint8_t rgbBlueStatus = 0x02;
 
-//static uint8_t barPos = 2;
-char* msg = NULL;
-
 void SysTick_Handler(void) {
 	msTicks++;
 }
@@ -82,22 +103,8 @@ uint32_t getMsTicks() {
 	return msTicks;
 }
 
-void init_TIM() {
-	CLKPWR_ConfigPPWR (CLKPWR_PCONP_PCTIM1, ENABLE);
-	CLKPWR_SetPCLKDiv (CLKPWR_PCLKSEL_TIMER1, CLKPWR_PCLKSEL_CCLK_DIV_1);
-
-	LPC_TIM1->CCR &= ~TIM_CTCR_MODE_MASK;
-	LPC_TIM1->CCR |= TIM_TIMER_MODE;
-
-	LPC_TIM1->TC = 0; // units of each count is 10^-8 s AKA 100 microseconds
-	LPC_TIM1->PC = 0;
-	LPC_TIM1->PR = 0;
-
-	// Clear interrupt pending
-	LPC_TIM1->IR = 0xFFFFFFFF;
-}
-
-static void init_ssp(void) {
+static void init_ssp(void)
+{
 	SSP_CFG_Type SSP_ConfigStruct;
 	PINSEL_CFG_Type PinCfg;
 
@@ -130,10 +137,10 @@ static void init_ssp(void) {
 
 	// Enable SSP peripheral
 	SSP_Cmd(LPC_SSP1, ENABLE);
-
 }
 
-static void init_i2c(void) {
+static void init_i2c(void)
+{
 	PINSEL_CFG_Type PinCfg;
 
 	/* Initialize I2C2 pin connect */
@@ -165,7 +172,6 @@ static void init_GPIO(void) {
 	PinCfg.Pinnum = 31;
 	PINSEL_ConfigPin(&PinCfg);
 	GPIO_SetDir(1, 1<<31, 0);
-
 }
 
 static void init_RGB(void) {
@@ -187,6 +193,16 @@ static void init_RGB(void) {
 	GPIO_SetDir( 2, (1<<1), 1 );
 }
 
+void pinsel_uart3(void){
+    PINSEL_CFG_Type PinCfg;
+    PinCfg.Funcnum = 2;
+    PinCfg.Pinnum = 0;
+    PinCfg.Portnum = 0;
+    PINSEL_ConfigPin(&PinCfg);
+    PinCfg.Pinnum = 1;
+    PINSEL_ConfigPin(&PinCfg);
+}
+
 void setRGB(uint8_t ledMask) {
     if ((ledMask & RGB_RED) != 0) {
         GPIO_SetValue( 2, (1<<0));
@@ -203,25 +219,33 @@ void setRGB(uint8_t ledMask) {
 
 void int_temp_read(void) {
 	if (tempCount == 0) {
-		startTime = LPC_TIM1->TC;
-	} else {
-		endTime = LPC_TIM1->TC;
-		if (endTime > startTime) {
-			endTime = endTime - startTime;
-		} else {
-			endTime = (0xFFFFFFFF - startTime + 1) + endTime; // In the case of overflow
+		startTime = getMsTicks();
+		endTime = 0;
+		tempCount++;
+	} else if (tempCount == 340) {
+		endTime = getMsTicks();
+		tempCount = 0;
+	    if (endTime > startTime) {
+	    	endTime = endTime - startTime;
+	    } else {
+	    	endTime = (0xFFFFFFFF - startTime + 1) + endTime; // In the case of overflow
+	    }
+		temperature = ( (1000*endTime) / (NUM_HALF_PERIODS*TEMP_SCALAR_DIV10) - 2731 );
+		if ((mode == COUNTDOWN) && (temperature >= TEMP_THRESHOLD_10C) && !isOverheatedCountdown) {
+			isOverheatedCountdown = 1;
 		}
+	} else {
+		tempCount++;
 	}
-	tempCount = !tempCount;
 }
 
 // Pre: Button has already been clicked once since entering Launch mode
 // Checks if the click is within one second of the previous click
 void return_check(void) {
 	if (isClickedAgain) {
-		currClick = LPC_TIM1->TC;
+		currClick = getMsTicks();
 		if (currClick > initialClick) {
-			if (currClick - initialClick <= 100000000) { // Clicked twice within 1 second, launch->return mode
+			if (currClick - initialClick <= 1000) { // Clicked twice within 1 second, launch->return mode
 				mode = RETURN;
 				isFirstClick = 1;
 				isClickedAgain = 0;
@@ -238,21 +262,54 @@ void return_check(void) {
 	}
 }
 
-void temp_check(void) {
-	temperature = ( (endTime / 100) - 2731 );
-	if ((mode == COUNTDOWN) && (temperature >= TEMP_THRESHOLD_10C) && !isOverheatedCountdown) {
-		isOverheatedCountdown = 1;
-	}
+void send_sensor_readings(void) {
+	sprintf(sensor_readings, "RPT Temp : %.2f; ACC X : %.2f, Y : %.2f \r\n", temperature/10.0, x/64.0, y/64.0);
+	UART_Send(LPC_UART3, (uint8_t *)sensor_readings, strlen(sensor_readings), BLOCKING);
 }
 
-void pinsel_uart3(void){
-    PINSEL_CFG_Type PinCfg;
-    PinCfg.Funcnum = 2;
-    PinCfg.Pinnum = 0;
-    PinCfg.Portnum = 0;
-    PINSEL_ConfigPin(&PinCfg);
-    PinCfg.Pinnum = 1;
-    PINSEL_ConfigPin(&PinCfg);
+void send_distance_reading(void) {
+	sprintf(distance_reading,"RPT Obstacle Distance: %d \r\n", light_val);
+	UART_Send(LPC_UART3, (uint8_t *)distance_reading, strlen(distance_reading), BLOCKING);
+}
+
+//UART interrupt handler
+void UART3_IRQHandler (void) {
+	 //UART3_StdIntHandler();
+
+	 if( ((LPC_UART3->IIR & 0xE) == 0b0100) || ((LPC_UART3->IIR & 0xE) == 0b1100) ) {
+		 UART_Receive(LPC_UART3, &data, 1, NONE_BLOCKING);
+		 if (data){
+
+			 //If input is not enter or a null character
+			 if ( data != '\r' && data !='\n'){
+				 umsg[len] = data;
+				 len++;
+			 }
+			 //If user has pressed enter
+			 if ( data == '\r'){
+
+				 //Sets 4th character to be null
+				 umsg[3] = '\0';
+
+				 //Check for RPT message
+				 if (strcmp(umsg,"RPT") == 0) {
+
+					 if (mode == LAUNCH) {
+						 send_sensor_readings();
+					 }
+					 if (mode == RETURN) {
+						 send_distance_reading();
+					 }
+				 }
+				 len = 0;
+			 }
+		 }
+		 data = 0;
+	 } else  {
+		 //Clear interrupt and data
+		 UART_Receive(LPC_UART3, &data, 1, NONE_BLOCKING);
+		 data = 0;
+	 }
 }
 
 void init_uart(void){
@@ -267,16 +324,30 @@ void init_uart(void){
     UART_Init(LPC_UART3, &uartCfg);
     //enable transmit for uart3
     UART_TxCmd(LPC_UART3, ENABLE);
+
+	UART_FIFO_CFG_Type FFConfig;
+
+	UART_FIFOConfigStructInit(&FFConfig);
+	FFConfig.FIFO_DMAMode = DISABLE;
+	FFConfig.FIFO_ResetRxBuf = ENABLE;
+	FFConfig.FIFO_ResetTxBuf = ENABLE;
+	FFConfig.FIFO_Level = UART_FIFO_TRGLEV2;
+	LPC_UART3->FCR = 1;
+
+	UART_FIFOConfig(LPC_UART3, &FFConfig);
+    UART_SetupCbs(LPC_UART3, 0, (void *)UART3_IRQHandler);
 }
 
 // EINT3 Interrupt Handler
 void EINT3_IRQHandler(void) {
+
+	//SW3
 	if ((LPC_GPIOINT->IO2IntStatF>>10)& 0x1) {
-		if (mode == STATIONARY && !isOverheated) {
+		if (mode == STATIONARY) {
 			mode = COUNTDOWN;
 		} else if (mode == LAUNCH) {
 	    	if (isFirstClick) {
-	    		initialClick = LPC_TIM1->TC;
+	    		initialClick = getMsTicks();
 		    	isFirstClick = 0;
 	    	} else {
 	    		isClickedAgain = 1;
@@ -287,38 +358,17 @@ void EINT3_IRQHandler(void) {
 	    }
 		LPC_GPIOINT->IO2IntClr = 1<<10;
 	}
+
+	//Temperature
 	if ((LPC_GPIOINT->IO0IntStatF>>2)& 0x1) {
 		int_temp_read();
 		LPC_GPIOINT->IO0IntClr = 1<<2;
 	}
 }
 
-void RIT_IRQHandler(void) {
-	isPrintTime = !isPrintTime;
-	LPC_RIT->RICTRL |= RIT_CTRL_INTEN;
-}
-
 int main (void) {
-    int32_t xoff = 0;
-    int32_t yoff = 0;
-    int32_t zoff = 0;
-
-    int8_t x = 0;
-    int8_t y = 0;
-    int8_t z = 0;
-    int8_t accInt = 0;
-    uint8_t dir = 1;
-    uint8_t wait = 0;
-
-    uint8_t state  = 0;
-
-    uint8_t clearWarning = 1;
-
-    uint8_t data = 0;
-    uint32_t len = 0;
-    uint8_t line[64];
-
     init_uart();
+
     init_i2c();
     init_ssp();
     init_GPIO();
@@ -330,50 +380,45 @@ int main (void) {
     oled_init();
     led7seg_init();
 
-    RIT_Init(LPC_RIT);
-    RIT_Cmd(LPC_RIT, DISABLE);
-    LPC_RIT->RICOMPVAL = 0xEE6B280; // set to compare every 10s
-	RIT_TimerClearCmd(LPC_RIT, ENABLE); // enable timer clear on match
-
     temp_init(&getMsTicks);
     light_enable();
     light_setRange(LIGHT_RANGE_4000);
 
     // Enable GPIO Interrupt P2.10 (SW3)
     LPC_GPIOINT->IO2IntEnF |= 1<<10;
+
     // Enable GPIO Interrupt P0.2 (Temp)
     LPC_GPIOINT->IO0IntEnF |= 1<<2;
 
     // Enable EINT3 interrupt
     NVIC_ClearPendingIRQ(EINT3_IRQn);
-    NVIC_SetPriority(EINT3_IRQn, 0);
     NVIC_EnableIRQ(EINT3_IRQn);
 
-    // Enable RIT interrupt
-    NVIC_SetPriority(RIT_IRQn, 1);
-    NVIC_EnableIRQ(RIT_IRQn);
+    //Enable Interrupt for UART3
+    NVIC_ClearPendingIRQ(UART3_IRQn);
+    UART_IntConfig(LPC_UART3, UART_INTCFG_RBR, ENABLE);
+    NVIC_EnableIRQ(UART3_IRQn);
 
-    init_TIM();
-    TIM_Cmd(LPC_TIM1, ENABLE);
 
     //Setup SysTick Timer to interrupt at 1 msec intervals
     if (SysTick_Config(SystemCoreClock / 1000)) {
     	while(1);
     }
 
-    //Assume base board in zero-g position when reading first value.
+    /*
+     * Assume base board in zero-g position when reading first value.
+     */
     acc_read(&x, &y, &z);
     xoff = 0-x;
     yoff = 0-y;
-    zoff = 64-z;
+    //zoff = 64-z;
 
     oled_clearScreen(OLED_COLOR_BLACK);
 
-    while (1)
-    {
-        /* ####### Modes  ###### */
-
+    while (1) {
+     /* ####### Modes  ###### */
     	switch(mode) {
+    		//Features: Temperature, Launch countdown
 			case STATIONARY:
 				if (firstEntry) {
 					pca9532_setLeds(0, 0xffff);
@@ -400,7 +445,6 @@ int main (void) {
 					led7seg_setChar(countdownNum[count],TRUE);
 					Timer0_Wait(200); // Reduced for quick testing, usually 1000
 					count++;
-					temp_check();
 					if (isOverheatedCountdown) { // Temp warning, ABORT launch
 						mode = STATIONARY;
 						isOverheatedCountdown = 0;
@@ -411,12 +455,15 @@ int main (void) {
 						oled_clearScreen(OLED_COLOR_BLACK);
 						msg = "Entering LAUNCH Mode \r\n";
 						UART_Send(LPC_UART3, (uint8_t *) msg, strlen(msg), BLOCKING);
-					    RIT_Cmd(LPC_RIT, ENABLE);
-					    LPC_RIT->RICOUNTER = 0x00000000;
 						break;
 					}
 				}
 				break;
+
+			/*Features: temperature, acc readings;
+			  blink red and blue LED for warning;
+			  send UART for warnings within 1s
+			  send UART every 10s */
 			case LAUNCH:
 				led7seg_setChar(countdownNum[15],TRUE);
 				if (!isOverheated) { // stop it from overwriting the temp too high
@@ -424,26 +471,35 @@ int main (void) {
 					oled_putString(0, 0, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
 				}
 				acc_read(&x, &y, &z);
-				x = x+xoff;
-				y = y+yoff;
+
+				//Absolute function for negative value
+				x = abs(x)+xoff;
+				y = abs(y)+yoff;
+
 				sprintf(result,"X: %.2fg\n", x/64.0);
 				oled_putString(0, 24, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
-				sprintf(result,"Y: %.2f\n", y/64.0);
+				sprintf(result,"Y: %.2fg\n", y/64.0);
 				oled_putString(0, 36, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
 				if (!isVeered && ((x/64.0 >= ACC_THRESHOLD) | (y/64.0 >= ACC_THRESHOLD))) {
 					isVeered = 1;
-					startBlinkBlue = LPC_TIM1->TC;
+					startBlinkBlue = getMsTicks();
 					msg = "VEER OFF COURSE \r\n";
 					UART_Send(LPC_UART3, (uint8_t *)msg , strlen(msg), BLOCKING);
 				}
-				if (isPrintTime) {
-					sprintf(result, "Temp : %.2f; ACC X : %.2f, Y : %.2f \r\n", temperature/10.0, x/64.0, y/64.0);
+
+				//Send temp and acc reading every 10 seconds
+				/*endLaunchLoop = getMsTicks();
+				if (endLaunchLoop - startLaunchLoop >= 10000) {
+					sprintf(result, "UPDATE Temp : %.2f; ACC X : %.2f, Y : %.2f \r\n", temperature/10.0, x/64.0, y/64.0);
 					msg = result;
 					UART_Send(LPC_UART3, (uint8_t *)msg , strlen(msg), BLOCKING);
-					isPrintTime = !isPrintTime;
-				}
+					startLaunchLoop = endLaunchLoop;
+				}*/
+
 				return_check();
 				break;
+
+			//Show obstacle distance
 			case RETURN:
 				if (isOverheated) {
 					setRGB(0);
@@ -458,10 +514,13 @@ int main (void) {
 				led7seg_setChar(countdownNum[15],TRUE);
 				sprintf(result,"RETURN");
 				oled_putString(0, 0, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
-		    	int32_t light_val = light_read();
-		    	sprintf(result,"Light: %d lux", light_val);
+		    	light_val = light_read();
+		    	//sprintf(result,"Light: %d lux", light_val);
+		    	sprintf(result,"Obstacle");
 		    	oled_putString(0, 12, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
-		    	if (light_val > OBS_THRESHOLD) {
+		    	sprintf(result,"Distance: %d", light_val);
+		    	oled_putString(0, 24, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
+		    	if (light_val > 3000) {
 		    		if (!isNearObs) {
 		    			msg = "OBSTACLE NEAR \r\n";
 		    			UART_Send(LPC_UART3, (uint8_t *)msg , strlen(msg), BLOCKING);
@@ -478,25 +537,39 @@ int main (void) {
 		    	}
 		    	light_val = (light_val/3892.0) * 17.0;
 				pca9532_setLeds(luxLevels[light_val], 0xffff);
+
+//				uint8_t data[10];
+//				uint32_t len = 0;
+//				uint8_t line[64];
+
+				//Receive and Send up to 3 letters to the terminal
+//				UART_Receive(LPC_UART3, data, 3, BLOCKING);
+//				data[3] = '\0';
+//				printf("%s\n", data);
+//				data[3] = '\n';
+//				data[4] = '\0';
+//				UART_Send(LPC_UART3, data, strlen(data), BLOCKING);
+
 				break;
 			default:
 				break;
     	}
 
         /* ####### Warnings ###### */
+        /* # */
 
 		if ((mode != RETURN) && (temperature >= TEMP_THRESHOLD_10C) && !isOverheated) {
         	rgbBlueStatus = RGB_BLUE; // veer -> overheat
 			isOverheated = 1;
 			oled_clearScreen(OLED_COLOR_BLACK);
-			startBlinkRed = LPC_TIM1->TC;
+			startBlinkRed = getMsTicks();
 			msg = "TEMP TOO HIGH \r\n";
 			UART_Send(LPC_UART3, (uint8_t *)msg , strlen(msg), BLOCKING);
 		}
 
 		if (isOverheated && isVeered) {
-    		endBlinkBlue = LPC_TIM1->TC;
-    		if (endBlinkBlue - startBlinkBlue >= 33300000) {
+    		endBlinkBlue = getMsTicks();
+    		if (endBlinkBlue - startBlinkBlue >= 333) {
     			startBlinkBlue = endBlinkBlue;
     			rgbBlueStatus = ~rgbBlueStatus;
     			rgbBlueStatus &= 0x03; // Only keep 2 LSB
@@ -515,9 +588,10 @@ int main (void) {
             	sprintf(result, "VEER OFF COURSE");
         		oled_putString(0, 48, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
             }
-		} else if (isOverheated) {
-    		endBlinkRed = LPC_TIM1->TC;
-    		if (endBlinkRed - startBlinkRed >= 33300000) {
+		}
+		else if (isOverheated) {
+    		endBlinkRed = getMsTicks();
+    		if (endBlinkRed - startBlinkRed >= 333) {
     			startBlinkRed = endBlinkRed;
     			rgbRedStatus ^= RGB_RED;
     		}
@@ -532,9 +606,10 @@ int main (void) {
             	sprintf(result, "TEMP TOO HIGH");
         		oled_putString(0, 0, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
             }
-    	} else if (isVeered) {
-    		endBlinkBlue = LPC_TIM1->TC;
-    		if (endBlinkBlue - startBlinkBlue >= 33300000) {
+    	}
+		else if (isVeered) {
+    		endBlinkBlue = getMsTicks();
+    		if (endBlinkBlue - startBlinkBlue >= 333) {
     			startBlinkBlue = endBlinkBlue;
     			rgbBlueStatus ^= RGB_BLUE;
     		}
@@ -553,22 +628,21 @@ int main (void) {
 
 		if (isNearObs && obsFlag) {
         	sprintf(result, "OBSTACLE NEAR");
-    		oled_putString(0, 24, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
+    		oled_putString(0, 48, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
     		obsFlag = 0;
 		} else if (!isNearObs && obsFlag){
         	sprintf(result, "                    ");
-    		oled_putString(0, 24, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
+    		oled_putString(0, 48, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
     		obsFlag = 0;
 		}
 
-        /* ####### Temperature Check ###### */
-
 		if (mode != RETURN) {
-			temp_check();
-			sprintf(result, "Temp: %.2fC", temperature/10.0);
+			sprintf(result, "Temp: %.2fC\n", temperature/10.0);
 			oled_putString(0, 12, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
 		}
 
+
+        Timer0_Wait(1);
     }
 
 
