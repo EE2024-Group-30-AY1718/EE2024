@@ -13,6 +13,7 @@
 #include "lpc17xx_timer.h"
 #include "lpc17xx_uart.h"
 #include "lpc17xx_rit.h"
+#include "lpc17xx_clkpwr.h"
 
 #include "joystick.h"
 #include "pca9532.h"
@@ -31,7 +32,6 @@
 #define OBS_THRESHOLD 3000
 #define RGB_RED   0x01
 #define RGB_BLUE  0x02
-
 
 const uint32_t lightLoLimit = 1;
 const uint32_t lightHiLimit = 4000;
@@ -55,6 +55,7 @@ volatile int isVeered = 0;
 volatile int isNearObs = 0;
 volatile int firstEntry = 1;
 volatile int obsFlag = 0;
+volatile int isPrintTime = 0;
 volatile int32_t tempCount = 0;
 volatile int32_t temperature = 0;
 volatile uint32_t startTime = 0;
@@ -70,8 +71,8 @@ volatile uint32_t initialClick = 0;
 volatile uint8_t rgbRedStatus = 0x01;
 volatile uint8_t rgbBlueStatus = 0x02;
 
-static uint8_t barPos = 2;
-static char* msg = NULL;
+//static uint8_t barPos = 2;
+char* msg = NULL;
 
 void SysTick_Handler(void) {
 	msTicks++;
@@ -79,6 +80,21 @@ void SysTick_Handler(void) {
 
 uint32_t getMsTicks() {
 	return msTicks;
+}
+
+void init_TIM() {
+	CLKPWR_ConfigPPWR (CLKPWR_PCONP_PCTIM1, ENABLE);
+	CLKPWR_SetPCLKDiv (CLKPWR_PCLKSEL_TIMER1, CLKPWR_PCLKSEL_CCLK_DIV_1);
+
+	LPC_TIM1->CCR &= ~TIM_CTCR_MODE_MASK;
+	LPC_TIM1->CCR |= TIM_TIMER_MODE;
+
+	LPC_TIM1->TC = 0; // units of each count is 10^-8 s AKA 100 microseconds
+	LPC_TIM1->PC = 0;
+	LPC_TIM1->PR = 0;
+
+	// Clear interrupt pending
+	LPC_TIM1->IR = 0xFFFFFFFF;
 }
 
 static void init_ssp(void) {
@@ -187,33 +203,25 @@ void setRGB(uint8_t ledMask) {
 
 void int_temp_read(void) {
 	if (tempCount == 0) {
-		startTime = getMsTicks();
-		endTime = 0;
-		tempCount++;
-	} else if (tempCount == 340) {
-		endTime = getMsTicks();
-		tempCount = 0;
-	    if (endTime > startTime) {
-	    	endTime = endTime - startTime;
-	    } else {
-	    	endTime = (0xFFFFFFFF - startTime + 1) + endTime; // In the case of overflow
-	    }
-		temperature = ( (1000*endTime) / (NUM_HALF_PERIODS*TEMP_SCALAR_DIV10) - 2731 );
-		if ((mode == COUNTDOWN) && (temperature >= TEMP_THRESHOLD_10C) && !isOverheatedCountdown) {
-			isOverheatedCountdown = 1;
-		}
+		startTime = LPC_TIM1->TC;
 	} else {
-		tempCount++;
+		endTime = LPC_TIM1->TC;
+		if (endTime > startTime) {
+			endTime = endTime - startTime;
+		} else {
+			endTime = (0xFFFFFFFF - startTime + 1) + endTime; // In the case of overflow
+		}
 	}
+	tempCount = !tempCount;
 }
 
 // Pre: Button has already been clicked once since entering Launch mode
 // Checks if the click is within one second of the previous click
 void return_check(void) {
 	if (isClickedAgain) {
-		currClick = getMsTicks();
+		currClick = LPC_TIM1->TC;
 		if (currClick > initialClick) {
-			if (currClick - initialClick <= 1000) { // Clicked twice within 1 second, launch->return mode
+			if (currClick - initialClick <= 100000000) { // Clicked twice within 1 second, launch->return mode
 				mode = RETURN;
 				isFirstClick = 1;
 				isClickedAgain = 0;
@@ -227,6 +235,13 @@ void return_check(void) {
 		}  else {
 			currClick = (0xFFFFFFFF - initialClick + 1) + currClick; // In the case of overflow
 		}
+	}
+}
+
+void temp_check(void) {
+	temperature = ( (endTime / 100) - 2731 );
+	if ((mode == COUNTDOWN) && (temperature >= TEMP_THRESHOLD_10C) && !isOverheatedCountdown) {
+		isOverheatedCountdown = 1;
 	}
 }
 
@@ -257,11 +272,11 @@ void init_uart(void){
 // EINT3 Interrupt Handler
 void EINT3_IRQHandler(void) {
 	if ((LPC_GPIOINT->IO2IntStatF>>10)& 0x1) {
-		if (mode == STATIONARY) {
+		if (mode == STATIONARY && !isOverheated) {
 			mode = COUNTDOWN;
 		} else if (mode == LAUNCH) {
 	    	if (isFirstClick) {
-	    		initialClick = getMsTicks();
+	    		initialClick = LPC_TIM1->TC;
 		    	isFirstClick = 0;
 	    	} else {
 	    		isClickedAgain = 1;
@@ -279,7 +294,8 @@ void EINT3_IRQHandler(void) {
 }
 
 void RIT_IRQHandler(void) {
-//	if (LPC_RIT->)
+	isPrintTime = !isPrintTime;
+	LPC_RIT->RICTRL |= RIT_CTRL_INTEN;
 }
 
 int main (void) {
@@ -314,7 +330,10 @@ int main (void) {
     oled_init();
     led7seg_init();
 
-    RIT_Init();
+    RIT_Init(LPC_RIT);
+    RIT_Cmd(LPC_RIT, DISABLE);
+    LPC_RIT->RICOMPVAL = 0xEE6B280; // set to compare every 10s
+	RIT_TimerClearCmd(LPC_RIT, ENABLE); // enable timer clear on match
 
     temp_init(&getMsTicks);
     light_enable();
@@ -327,48 +346,32 @@ int main (void) {
 
     // Enable EINT3 interrupt
     NVIC_ClearPendingIRQ(EINT3_IRQn);
+    NVIC_SetPriority(EINT3_IRQn, 0);
     NVIC_EnableIRQ(EINT3_IRQn);
 
+    // Enable RIT interrupt
+    NVIC_SetPriority(RIT_IRQn, 1);
     NVIC_EnableIRQ(RIT_IRQn);
+
+    init_TIM();
+    TIM_Cmd(LPC_TIM1, ENABLE);
 
     //Setup SysTick Timer to interrupt at 1 msec intervals
     if (SysTick_Config(SystemCoreClock / 1000)) {
     	while(1);
     }
 
-    /*
-     * Assume base board in zero-g position when reading first value.
-     */
+    //Assume base board in zero-g position when reading first value.
     acc_read(&x, &y, &z);
     xoff = 0-x;
     yoff = 0-y;
     zoff = 64-z;
 
-    /* ####### Speaker  ###### */
-    /* # */
-
-//    GPIO_SetDir(2, 1<<0, 1);
-//    GPIO_SetDir(2, 1<<1, 1);
-//
-//    GPIO_SetDir(0, 1<<27, 1);
-//    GPIO_SetDir(0, 1<<28, 1);
-//    GPIO_SetDir(2, 1<<13, 1);
-//    GPIO_SetDir(0, 1<<26, 1);
-//
-//    GPIO_ClearValue(0, 1<<27); //LM4811-clk
-//    GPIO_ClearValue(0, 1<<28); //LM4811-up/dn
-//    GPIO_ClearValue(2, 1<<13); //LM4811-shutdn
-
-    /* # */
-    /* ############################################# */
-
-//    moveBar(1, dir);
     oled_clearScreen(OLED_COLOR_BLACK);
 
     while (1)
     {
         /* ####### Modes  ###### */
-        /* # */
 
     	switch(mode) {
 			case STATIONARY:
@@ -397,6 +400,7 @@ int main (void) {
 					led7seg_setChar(countdownNum[count],TRUE);
 					Timer0_Wait(200); // Reduced for quick testing, usually 1000
 					count++;
+					temp_check();
 					if (isOverheatedCountdown) { // Temp warning, ABORT launch
 						mode = STATIONARY;
 						isOverheatedCountdown = 0;
@@ -407,7 +411,8 @@ int main (void) {
 						oled_clearScreen(OLED_COLOR_BLACK);
 						msg = "Entering LAUNCH Mode \r\n";
 						UART_Send(LPC_UART3, (uint8_t *) msg, strlen(msg), BLOCKING);
-//						startLaunchLoop = getMsTicks();
+					    RIT_Cmd(LPC_RIT, ENABLE);
+					    LPC_RIT->RICOUNTER = 0x00000000;
 						break;
 					}
 				}
@@ -423,21 +428,20 @@ int main (void) {
 				y = y+yoff;
 				sprintf(result,"X: %.2fg\n", x/64.0);
 				oled_putString(0, 24, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
-				sprintf(result,"Y: %.2fg\n", y/64.0);
+				sprintf(result,"Y: %.2f\n", y/64.0);
 				oled_putString(0, 36, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
 				if (!isVeered && ((x/64.0 >= ACC_THRESHOLD) | (y/64.0 >= ACC_THRESHOLD))) {
 					isVeered = 1;
-					startBlinkBlue = getMsTicks();
+					startBlinkBlue = LPC_TIM1->TC;
 					msg = "VEER OFF COURSE \r\n";
 					UART_Send(LPC_UART3, (uint8_t *)msg , strlen(msg), BLOCKING);
 				}
-//				endLaunchLoop = getMsTicks();
-//				if (endLaunchLoop - startLaunchLoop >= 10000) {
-//					sprintf(result, "Temp : %.2f; ACC X : %.2f, Y : %.2f \r\n", temperature/10.0, x/64.0, y/64.0);
-//					msg = result;
-//					UART_Send(LPC_UART3, (uint8_t *)msg , strlen(msg), BLOCKING);
-//					startLaunchLoop = endLaunchLoop;
-//				}
+				if (isPrintTime) {
+					sprintf(result, "Temp : %.2f; ACC X : %.2f, Y : %.2f \r\n", temperature/10.0, x/64.0, y/64.0);
+					msg = result;
+					UART_Send(LPC_UART3, (uint8_t *)msg , strlen(msg), BLOCKING);
+					isPrintTime = !isPrintTime;
+				}
 				return_check();
 				break;
 			case RETURN:
@@ -480,20 +484,19 @@ int main (void) {
     	}
 
         /* ####### Warnings ###### */
-        /* # */
 
 		if ((mode != RETURN) && (temperature >= TEMP_THRESHOLD_10C) && !isOverheated) {
         	rgbBlueStatus = RGB_BLUE; // veer -> overheat
 			isOverheated = 1;
 			oled_clearScreen(OLED_COLOR_BLACK);
-			startBlinkRed = getMsTicks();
+			startBlinkRed = LPC_TIM1->TC;
 			msg = "TEMP TOO HIGH \r\n";
 			UART_Send(LPC_UART3, (uint8_t *)msg , strlen(msg), BLOCKING);
 		}
 
 		if (isOverheated && isVeered) {
-    		endBlinkBlue = getMsTicks();
-    		if (endBlinkBlue - startBlinkBlue >= 333) {
+    		endBlinkBlue = LPC_TIM1->TC;
+    		if (endBlinkBlue - startBlinkBlue >= 33300000) {
     			startBlinkBlue = endBlinkBlue;
     			rgbBlueStatus = ~rgbBlueStatus;
     			rgbBlueStatus &= 0x03; // Only keep 2 LSB
@@ -512,10 +515,9 @@ int main (void) {
             	sprintf(result, "VEER OFF COURSE");
         		oled_putString(0, 48, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
             }
-		}
-		else if (isOverheated) {
-    		endBlinkRed = getMsTicks();
-    		if (endBlinkRed - startBlinkRed >= 333) {
+		} else if (isOverheated) {
+    		endBlinkRed = LPC_TIM1->TC;
+    		if (endBlinkRed - startBlinkRed >= 33300000) {
     			startBlinkRed = endBlinkRed;
     			rgbRedStatus ^= RGB_RED;
     		}
@@ -530,10 +532,9 @@ int main (void) {
             	sprintf(result, "TEMP TOO HIGH");
         		oled_putString(0, 0, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
             }
-    	}
-		else if (isVeered) {
-    		endBlinkBlue = getMsTicks();
-    		if (endBlinkBlue - startBlinkBlue >= 333) {
+    	} else if (isVeered) {
+    		endBlinkBlue = LPC_TIM1->TC;
+    		if (endBlinkBlue - startBlinkBlue >= 33300000) {
     			startBlinkBlue = endBlinkBlue;
     			rgbBlueStatus ^= RGB_BLUE;
     		}
@@ -560,49 +561,14 @@ int main (void) {
     		obsFlag = 0;
 		}
 
+        /* ####### Temperature Check ###### */
+
 		if (mode != RETURN) {
-			sprintf(result, "Temp: %.2fC\n", temperature/10.0);
+			temp_check();
+			sprintf(result, "Temp: %.2fC", temperature/10.0);
 			oled_putString(0, 12, (uint8_t *)result,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
 		}
 
-
-//    	int32_t light_val = light_read();
-//    	sprintf(LightPrint,"Light is %d lux.", light_val);
-//    	oled_putString(0, 20, (uint8_t *)LightPrint,OLED_COLOR_WHITE, OLED_COLOR_BLACK );
-
-        /* ####### Accelerometer and LEDs  ###### */
-        /* # */
-
-//        acc_read(&x, &y, &z);
-//        x = x+xoff;
-//        y = y+yoff;
-//        z = z+zoff;
-//
-//        if (y < 0) {
-//            dir = 1;
-//            y = -y;
-//        }
-//        else {
-//            dir = -1;
-//        }
-//
-//        if (y > 1 && wait++ > (40 / (1 + (y/10)))) {
-//            moveBar(1, dir);
-//            wait = 0;
-//        }
-
-        /* ############ Trimpot and RGB LED  ########### */
-        /* # */
-
-//        if (btn1 == 0)
-//        {
-//        	led7seg_setChar('7',FALSE);
-//            playSong(song);
-//
-//        }
-
-
-        Timer0_Wait(1);
     }
 
 
